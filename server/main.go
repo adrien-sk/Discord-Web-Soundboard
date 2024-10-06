@@ -3,18 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
 	"os"
 	"time"
 
 	discordOAuth "github.com/adrien-sk/Discord-Web-Soundboard/pkg/discordOauth"
+	"github.com/adrien-sk/Discord-Web-Soundboard/pkg/websocket"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	_ "github.com/joho/godotenv/autoload"
 	"golang.org/x/oauth2"
 )
+
+// ---------------------------------------------- Variables and Structs
 
 type Sound struct {
 	Name string `json:"name"`
@@ -41,11 +44,12 @@ var conf = &oauth2.Config{
 }
 
 var sessions = map[string]User{}
-
 var state = "random"
 
+// ---------------------------------------------- Main function
+
 func main() {
-	print("Starting Go server")
+	fmt.Println("Starting Go server")
 
 	router := gin.Default()
 	config := cors.DefaultConfig()
@@ -57,13 +61,21 @@ func main() {
 	config.MaxAge = 12 * time.Hour
 	router.Use(cors.New(config))
 
+	pool := websocket.NewPool()
+	go pool.Start()
+
 	router.GET("/sounds", getSoundsHandler)
 	router.GET("/auth", authHandler)
 	router.GET("/auth/callback", authCallbackHandler)
 	router.GET("/auth/isauthenticated", authIsAuthenticatedHandler)
+	router.GET("/ws", func(c *gin.Context) {
+		serveWs(pool, c)
+	})
 
 	router.Run("localhost:8080")
 }
+
+// ---------------------------------------------- API Handlers
 
 func getSoundsHandler(c *gin.Context) {
 	c.IndentedJSON(http.StatusOK, sounds)
@@ -76,7 +88,7 @@ func authHandler(c *gin.Context) {
 
 // Step 2: After user authenticates their accounts this callback is fired.
 func authCallbackHandler(c *gin.Context) {
-	println("-- auth Callback Handler")
+	fmt.Println("-- auth Callback Handler")
 
 	// State verification before continuing
 	if c.Request.FormValue("state") != state {
@@ -126,7 +138,7 @@ func authCallbackHandler(c *gin.Context) {
 }
 
 func authIsAuthenticatedHandler(c *gin.Context) {
-	println("-- auth IsAuthenticated Callback Handler")
+	fmt.Println("-- auth IsAuthenticated Callback Handler")
 
 	cookie, err := c.Cookie("discord.oauth2")
 
@@ -138,13 +150,44 @@ func authIsAuthenticatedHandler(c *gin.Context) {
 
 	userSession, exists := sessions[cookie]
 	if !exists {
-		log.Printf("IsAuthenticated for : " + userSession.Username)
+		fmt.Printf("IsAuthenticated for : " + userSession.Username)
 		// If the session token is not present in session map, return an unauthorized error
 		c.Writer.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
-	log.Print(sessions)
+	fmt.Print(sessions)
 
 	c.Writer.WriteHeader(http.StatusOK)
 }
+
+// ---------------------------------------------- Websockets Methods
+
+func serveWs(pool *websocket.Pool, c *gin.Context) {
+	fmt.Println("WebSocket Endpoint Hit")
+	cookie, err := c.Cookie("discord.oauth2")
+	userSession, exists := sessions[cookie]
+	if err != nil || !exists {
+		fmt.Printf("serveWs fail for : " + userSession.Username)
+		c.Writer.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	conn, err := websocket.Upgrade(c.Writer, c.Request)
+	if err != nil {
+		fmt.Fprintf(c.Writer, "%+v\n", err)
+		c.Writer.WriteHeader(http.StatusInternalServerError)
+		c.Writer.Write([]byte(err.Error()))
+		return
+	}
+
+	client := &websocket.Client{
+		Conn: conn,
+		Pool: pool,
+	}
+
+	pool.Register <- client
+	client.Read()
+}
+
+// ---------------------------------------------- Discord bot methods
